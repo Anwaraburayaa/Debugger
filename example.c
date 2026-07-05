@@ -128,30 +128,6 @@ unsigned long parse_elf(const char* target_sym, void* file_contents)
     return 0;
 }
 
-    // TODO 4: Iterate through all symbols in the Symbol Table.
-    //         Compare each symbol's name with `target_sym` using strcmp.
-Elf64_sym* sym_ctr=symbol_table_size/sizeof(Elf64_Sym);
-///we cast symtable into array
-    Elf64_Sym* sym_table = (Elf64_Sym*)((char*)file_contents + symbol_table_offset);
-for(int i=0;i<sym_ctr;i++){
-// Get the symbol's name from the String Table
-        const char* sym_name = (const char*)file_contents + string_table_offset + sym_table[i].st_name;
-
-        // Compare with the target symbol
-        if (strcmp(sym_name, target_sym) == 0) {
-            // Return the symbol's address (st_value)
-            printf("PRF:: symbol address is 0x%lx\n", symbols[i].st_value);
-            return sym_table[i].st_value;
-        }
-     return 0;
-
-    }
-}
-
-
-
-
-
 /*
  * Main debugger tracing loop.
  */
@@ -159,65 +135,190 @@ void run_tracer(pid_t child_pid, unsigned long addr, int nr_params)
 {
     int wait_status;
     struct user_regs_struct regs;
+    int func_call_ctr = 0; ///counter for how many times the func will be called
+    int rec_depth = 0;
+    int depth_capacity = 64; ///starting array size
 
-    // Variables you will likely need to manage state:
-    // int call_counter = 0;
-    // int current_depth = 0; // To distinguish main calls from recursive calls
-    // unsigned long original_data; // To store the byte you replace with 0xCC
+    unsigned long* return_address_stack = (unsigned long*)malloc(depth_capacity * sizeof(unsigned long));
+    long* saved_return_instructions = (long*)malloc(depth_capacity * sizeof(long));
+    long target_original_instruction;
 
-    wait(&wait_status); // Wait for the child to stop right after fork/execv
+    wait(&wait_status); /// Wait for the child to stop right after fork/execv
 
-    // --- PHASE B: CHECK PROLOGUE ---
-    // TODO 6: Read the data at 'addr' using ptrace(PTRACE_PEEKTEXT, child_pid, (void*)addr, NULL).
-    // TODO 7: Save this data (you will need to restore it later).
-    // TODO 8: Extract the first byte. If it is 0x55 (push rbp), print:
-    //         printf("PRF:: This function starts by pushing rbp\n");
+    ///we read first 8 bytes from target
+    target_original_instruction = ptrace(PTRACE_PEEKTEXT, child_pid, (void*)addr, NULL);
 
-    // TODO 9: Main Tracing Loop
-    // while (WIFSTOPPED(wait_status)) {
+    ///we check if fisr byte is 0X55
+    if ((target_original_instruction & 0xFF) == 0x55) {
+        printf("PRF:: This function starts by pushing rbp\n");
+    }
 
-        // --- PHASE C: TRACING PARAMETERS ---
-        // TODO 10: Plant a Breakpoint at 'addr'. Overwrite the first byte with 0xCC
-        //          using ptrace(PTRACE_POKETEXT...).
+    /// Main Tracing Loop
+    while (WIFSTOPPED(wait_status)) {
 
-        // TODO 11: Continue execution: ptrace(PTRACE_CONT, child_pid, NULL, NULL);
-        // TODO 12: wait(&wait_status);
+        ///we save the upper 7 bytes and change first to 0xcc
+        long break_point = (target_original_instruction & ~0xFFL) | 0xCC;
 
-        // TODO 13: Check if child exited (if WIFEXITED(wait_status), break the loop).
+        /// we put break point in the target func addr
+        ptrace(PTRACE_POKETEXT, child_pid, (void*)addr, (void*)break_point);
+        ptrace(PTRACE_CONT, child_pid, NULL, NULL);
 
-        // We hit the function!
-        // TODO 14: Get registers: ptrace(PTRACE_GETREGS, child_pid, NULL, &regs);
+        ///we wiat the prog to arrive to breakp
+        wait(&wait_status);
 
-        // TODO 15: Determine if this is a new outer call or a recursive call.
-        //          (Hint: You might need to track the return addresses on a stack
-        //          or just track the depth).
-        //          - If OUTER call (depth == 0): print "PRF:: run #%d called with (...):\n"
-        //          - If RECURSIVE call (depth > 0): print "PRF::    entered recursive call with (...)\n"
-        //          Use `nr_params` to know which registers to read (rdi, rsi, rdx, rcx, r8, r9).
+        ///if it finishes we go out!
+        if (WIFEXITED(wait_status)) {
+            break;
+        }
 
-        // TODO 16: Read the return address from the top of the stack (regs.rsp).
-        //          Use ptrace(PTRACE_PEEKTEXT...) at regs.rsp to get the return address.
+        ///else we update regs and cpu to see where it stopped
+        ptrace(PTRACE_GETREGS, child_pid, NULL, &regs);
 
-        // --- PHASE D PREPARATION: RESTORE AND SET RETURN BREAKPOINT ---
-        // TODO 17: Restore the original byte at 'addr' so the function can actually run.
-        // TODO 18: Decrement regs.rip by 1 (regs.rip--) and update registers:
-        //          ptrace(PTRACE_SETREGS, child_pid, NULL, &regs);
+        ///calc real address
+        unsigned long stopped_address = regs.rip - 1;
 
-        // TODO 19: Plant a Breakpoint (0xCC) at the *return address* you found in step 16.
-        //          (Remember to save the original data at the return address first!)
+        /// --- PATH A: FUNCTION ENTRY ---
+        /// If the program stopped exactly at our target function
+        if (stopped_address == addr) {
 
-        // TODO 20: Continue execution: ptrace(PTRACE_CONT, child_pid, NULL, NULL);
-        // TODO 21: wait(&wait_status);
+            /// expand stack if rec is deep
+            if (rec_depth >= depth_capacity) {
+                depth_capacity *= 2;
+                return_address_stack = (unsigned long*)realloc(return_address_stack, depth_capacity * sizeof(unsigned long));
+                saved_return_instructions = (long*)realloc(saved_return_instructions, depth_capacity * sizeof(long));
+            }
 
-        // We hit the return address!
-        // TODO 22: Get registers again to catch the return value.
-        // TODO 23: If this was returning from an OUTER call (depth goes back to 0),
-        //          print the return value from RAX:
-        //          printf("PRF::  call to function returned with %lld\n", regs.rax);
+            /// LOG ENTRY & PRINT
+            rec_depth++;
+            if (rec_depth == 1) {
+                func_call_ctr++;
+                printf("PRF:: run #%d called with (", func_call_ctr);
+            } else {
+                printf("    PRF:: entered recursive call with (");
+            }
 
-        // TODO 24: Restore the original data at the return address.
-        // TODO 25: Decrement regs.rip by 1 and update registers (PTRACE_SETREGS).
-    // }
+            /// Print regs based on nr_params
+            switch (nr_params) {
+                case 0:
+                    break;
+                case 1:
+                    printf("%lld", (long long)regs.rdi);
+                    break;
+                case 2:
+                    printf("%lld, %lld", (long long)regs.rdi, (long long)regs.rsi);
+                    break;
+                case 3:
+                    printf("%lld, %lld, %lld", (long long)regs.rdi, (long long)regs.rsi, (long long)regs.rdx);
+                    break;
+                case 4:
+                    printf("%lld, %lld, %lld, %lld", (long long)regs.rdi, (long long)regs.rsi, (long long)regs.rdx, (long long)regs.rcx);
+                    break;
+                case 5:
+                    printf("%lld, %lld, %lld, %lld, %lld", (long long)regs.rdi, (long long)regs.rsi, (long long)regs.rdx, (long long)regs.rcx, (long long)regs.r8);
+                    break;
+                case 6:
+                    printf("%lld, %lld, %lld, %lld, %lld, %lld", (long long)regs.rdi, (long long)regs.rsi, (long long)regs.rdx, (long long)regs.rcx, (long long)regs.r8, (long long)regs.r9);
+                    break;
+                default:
+                    break;
+            }
+
+            if (rec_depth == 1) {
+                printf("):\n");
+            } else {
+                printf(")\n");
+            }
+
+            /// 1. Read the return ticket from the top of the Stack (RSP)
+            unsigned long ret_addr = ptrace(PTRACE_PEEKTEXT, child_pid, (void*)regs.rsp, NULL);
+            return_address_stack[rec_depth - 1] = ret_addr;
+
+            /// check: does an outer, still-waiting frame already have a break_point sitting
+            /// at this exact address? (happens when the caller, like rec_bar, always calls us
+            /// from the same instruction, so different recursion levels share one exit door)
+            /// if so we must NOT peek it now (byte there is already 0xcc from the outer plant,
+            /// we'd end up saving a corrupted "original"), and must NOT plant again either
+            int already_has_break_point = 0;
+            long reused_original_instruction = 0;
+            for (int k = 0; k < rec_depth - 1; k++) {
+                if (return_address_stack[k] == ret_addr) {
+                    already_has_break_point = 1;
+                    reused_original_instruction = saved_return_instructions[k];
+                    break;
+                }
+            }
+
+            if (already_has_break_point) {
+                /// 2. just reuse the real original instruction the outer frame already grabbed
+                saved_return_instructions[rec_depth - 1] = reused_original_instruction;
+                /// 3. break_point already planted by that outer frame, nothing more to do here
+            } else {
+                /// 2. Backup the real code at that exit door
+                long ret_original = ptrace(PTRACE_PEEKTEXT, child_pid, (void*)ret_addr, NULL);
+                saved_return_instructions[rec_depth - 1] = ret_original;
+
+                /// 3. Plant our 0xCC break_point at the exit door
+                long ret_break_point = (ret_original & ~0xFFL) | 0xCC;
+                ptrace(PTRACE_POKETEXT, child_pid, (void*)ret_addr, (void*)ret_break_point);
+            }
+
+            /// 1. Remove the entry trap temporarily so it doesn't crash
+            ptrace(PTRACE_POKETEXT, child_pid, (void*)addr, (void*)target_original_instruction);
+
+            /// 2. Move the RIP pointer back 1 byte to read the real instruction
+            regs.rip = stopped_address;
+            ptrace(PTRACE_SETREGS, child_pid, NULL, &regs);
+
+            /// 3. Let it execute exactly ONE instruction, then pause it again
+            ptrace(PTRACE_SINGLESTEP, child_pid, NULL, NULL);
+            wait(&wait_status);
+        }
+        /// --- PATH B: FUNCTION RETURN ---
+        /// If the program stopped at the return address we saved earlier
+        else if (rec_depth > 0 && stopped_address == return_address_stack[rec_depth - 1]) {
+
+            /// check: does a shallower (still-waiting) frame ALSO return through this exact
+            /// same exit door? (same shared-call-site thing as on entry) if so we can't just
+            /// restore-and-forget - that frame still needs the break_point here later on
+            int break_point_still_needed = 0;
+            for (int k = 0; k < rec_depth - 1; k++) {
+                if (return_address_stack[k] == stopped_address) {
+                    break_point_still_needed = 1;
+                    break;
+                }
+            }
+
+            /// 2. If we are finishing the very first (outer) call, print the return value
+            if (rec_depth == 1) {
+                printf("  PRF:: call to function returned with %lld\n", (long long)regs.rax);
+            }
+
+            /// 3. We left the function, so decrease the recursion depth
+            rec_depth--;
+
+            /// 4. Move RIP back 1 byte to execute the real return instruction
+            regs.rip = stopped_address;
+            ptrace(PTRACE_SETREGS, child_pid, NULL, &regs);
+
+            if (!break_point_still_needed) {
+                /// 1. nobody else needs this break_point anymore, remove it for real
+                ptrace(PTRACE_POKETEXT, child_pid, (void*)stopped_address, (void*)saved_return_instructions[rec_depth]);
+            } else {
+                /// 1. someone shallower still needs this break_point: restore it, step past
+                ///    it ourselves, then plant it back so their break_point is there when they return
+                ptrace(PTRACE_POKETEXT, child_pid, (void*)stopped_address, (void*)saved_return_instructions[rec_depth]);
+                ptrace(PTRACE_SINGLESTEP, child_pid, NULL, NULL);
+                waitpid(child_pid, &wait_status, 0);
+                long original_instruction = saved_return_instructions[rec_depth];
+                long break_point_again = (original_instruction & ~0xFFL) | 0xCC;
+                ptrace(PTRACE_POKETEXT, child_pid, (void*)stopped_address, (void*)break_point_again);
+            }
+        }
+    }
+
+    /// clean up memory
+    free(return_address_stack);
+    free(saved_return_instructions);
 }
 
 int main(int argc, char* const argv[])
@@ -241,7 +342,6 @@ int main(int argc, char* const argv[])
     // Free the allocated memory
     free(file_content);
 
-    // --- TODO 26: CHECK IF SYMBOL WAS FOUND ---
     // If parse_elf returned 0, it wasn't found.
     // You MUST print "PRF:: symbol not found\n" and return 1.
     if (addr == 0) {
