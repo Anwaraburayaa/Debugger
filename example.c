@@ -80,51 +80,41 @@ void* get_elf_content(const char* sym_name, const char* file_name)
 
 unsigned long parse_elf(const char* target_sym, void* file_contents)
 {
-    // --- PHASE A: FIND SYMBOL ADDRESS ---
-
-    // 1. Cast `file_contents` to an ELF header pointer
     Elf64_Ehdr* elf_header = (Elf64_Ehdr*)file_contents;
-
-    // 2. Find the Section Header Table
     Elf64_Shdr* section_headers = (Elf64_Shdr*)((char*)file_contents + elf_header->e_shoff);
-
-    // 3. Iterate over the section headers to find the Symbol Table and String Table
     unsigned long symbol_table_offset = 0;
     unsigned long symbol_table_size = 0;
     unsigned long string_table_offset = 0;
-
+///now we look for symtable
     for (int i = 0; i < elf_header->e_shnum; i++) {
         if (section_headers[i].sh_type == SHT_SYMTAB) {
             symbol_table_offset = section_headers[i].sh_offset;
             symbol_table_size = section_headers[i].sh_size;
-
+///we get the string talble
             int string_table_index = section_headers[i].sh_link;
             string_table_offset = section_headers[string_table_index].sh_offset;
             break;
         }
     }
 
-    // 4. Calculate symbol count (Fixed from pointer to int)
-    int num_symbols = symbol_table_size / sizeof(Elf64_Sym);
 
-    // Cast symtable into array
+    int num_symbols = symbol_table_size / sizeof(Elf64_Sym);
     Elf64_Sym* sym_table = (Elf64_Sym*)((char*)file_contents + symbol_table_offset);
 
-    // 5. Iterate through all symbols
+    ///we go through the symbol table to find the target symbol
     for(int i = 0; i < num_symbols; i++) {
 
-        // Get the symbol's name from the String Table
+        /// we get the symbol's name from the String Table
         const char* sym_name = (const char*)file_contents + string_table_offset + sym_table[i].st_name;
 
-        // Compare with the target symbol
+        /// Compare with the target symbol
         if (strcmp(sym_name, target_sym) == 0) {
-            // Fixed variable name to match your array (sym_table)
-            printf("PRF:: symbol address is 0x%lx\n", sym_table[i].st_value);
+            printf("PRF:: symbol address is 0x%lX\n", sym_table[i].st_value);
             return sym_table[i].st_value;
         }
     }
 
-    // Fixed: Moved outside the loop! Only return 0 if the whole loop finishes without a match.
+///we return 0 if the symbol is not found
     return 0;
 }
 
@@ -141,6 +131,7 @@ void run_tracer(pid_t child_pid, unsigned long addr, int nr_params)
 
     unsigned long* return_address_stack = (unsigned long*)malloc(depth_capacity * sizeof(unsigned long));
     long* saved_return_instructions = (long*)malloc(depth_capacity * sizeof(long));
+    unsigned long* entry_rsp_stack = (unsigned long*)malloc(depth_capacity * sizeof(unsigned long)); ///rsp at call time, to tell real ret from a coincidental jmp landing on the ret addr
     long target_original_instruction;
 
     wait(&wait_status); /// Wait for the child to stop right after fork/execv
@@ -157,10 +148,11 @@ void run_tracer(pid_t child_pid, unsigned long addr, int nr_params)
     while (WIFSTOPPED(wait_status)) {
 
         ///we save the upper 7 bytes and change first to 0xcc
-        long break_point = (target_original_instruction & ~0xFFL) | 0xCC;
+        long our_trap = (target_original_instruction & ~0xFFL) | 0xCC;
 
         /// we put break point in the target func addr
-        ptrace(PTRACE_POKETEXT, child_pid, (void*)addr, (void*)break_point);
+        ptrace(PTRACE_POKETEXT, child_pid, (void*)addr, (void*)our_trap);
+
         ptrace(PTRACE_CONT, child_pid, NULL, NULL);
 
         ///we wiat the prog to arrive to breakp
@@ -171,30 +163,30 @@ void run_tracer(pid_t child_pid, unsigned long addr, int nr_params)
             break;
         }
 
-        ///else we update regs and cpu to see where it stopped
+        ///else we update regs state
         ptrace(PTRACE_GETREGS, child_pid, NULL, &regs);
 
-        ///calc real address
+        ///calc the addr where the proogram stopped
         unsigned long stopped_address = regs.rip - 1;
 
-        /// --- PATH A: FUNCTION ENTRY ---
-        /// If the program stopped exactly at our target function
+        /// we check if the program stopped exactly at our target func
         if (stopped_address == addr) {
 
-            /// expand stack if rec is deep
+            /// we expand stack if rec is deep
             if (rec_depth >= depth_capacity) {
                 depth_capacity *= 2;
                 return_address_stack = (unsigned long*)realloc(return_address_stack, depth_capacity * sizeof(unsigned long));
                 saved_return_instructions = (long*)realloc(saved_return_instructions, depth_capacity * sizeof(long));
+                entry_rsp_stack = (unsigned long*)realloc(entry_rsp_stack, depth_capacity * sizeof(unsigned long));
             }
 
-            /// LOG ENTRY & PRINT
+
             rec_depth++;
             if (rec_depth == 1) {
                 func_call_ctr++;
                 printf("PRF:: run #%d called with (", func_call_ctr);
             } else {
-                printf("    PRF:: entered recursive call with (");
+                printf("PRF::     entered recursive call with (");
             }
 
             /// Print regs based on nr_params
@@ -202,22 +194,22 @@ void run_tracer(pid_t child_pid, unsigned long addr, int nr_params)
                 case 0:
                     break;
                 case 1:
-                    printf("%lld", (long long)regs.rdi);
+                    printf("%d", (int)regs.rdi);
                     break;
                 case 2:
-                    printf("%lld, %lld", (long long)regs.rdi, (long long)regs.rsi);
+                    printf("%d, %d", (int)regs.rdi, (int)regs.rsi);
                     break;
                 case 3:
-                    printf("%lld, %lld, %lld", (long long)regs.rdi, (long long)regs.rsi, (long long)regs.rdx);
+                    printf("%d, %d, %d", (int)regs.rdi, (int)regs.rsi, (int)regs.rdx);
                     break;
                 case 4:
-                    printf("%lld, %lld, %lld, %lld", (long long)regs.rdi, (long long)regs.rsi, (long long)regs.rdx, (long long)regs.rcx);
+                    printf("%d, %d, %d, %d", (int)regs.rdi, (int)regs.rsi, (int)regs.rdx, (int)regs.rcx);
                     break;
                 case 5:
-                    printf("%lld, %lld, %lld, %lld, %lld", (long long)regs.rdi, (long long)regs.rsi, (long long)regs.rdx, (long long)regs.rcx, (long long)regs.r8);
+                    printf("%d, %d, %d, %d, %d", (int)regs.rdi, (int)regs.rsi, (int)regs.rdx, (int)regs.rcx, (int)regs.r8);
                     break;
                 case 6:
-                    printf("%lld, %lld, %lld, %lld, %lld, %lld", (long long)regs.rdi, (long long)regs.rsi, (long long)regs.rdx, (long long)regs.rcx, (long long)regs.r8, (long long)regs.r9);
+                    printf("%d, %d, %d, %d, %d, %d", (int)regs.rdi, (int)regs.rsi, (int)regs.rdx, (int)regs.rcx, (int)regs.r8, (int)regs.r9);
                     break;
                 default:
                     break;
@@ -229,57 +221,63 @@ void run_tracer(pid_t child_pid, unsigned long addr, int nr_params)
                 printf(")\n");
             }
 
-            /// 1. Read the return ticket from the top of the Stack (RSP)
+         ////we save return address and the instruction at that address
             unsigned long ret_addr = ptrace(PTRACE_PEEKTEXT, child_pid, (void*)regs.rsp, NULL);
             return_address_stack[rec_depth - 1] = ret_addr;
+            entry_rsp_stack[rec_depth - 1] = regs.rsp; ///save rsp now so we can check later if a real pop happened
 
-            /// check: does an outer, still-waiting frame already have a break_point sitting
-            /// at this exact address? (happens when the caller, like rec_bar, always calls us
-            /// from the same instruction, so different recursion levels share one exit door)
-            /// if so we must NOT peek it now (byte there is already 0xcc from the outer plant,
-            /// we'd end up saving a corrupted "original"), and must NOT plant again either
+           ///flag to know if outer rec level already has 0xcc
             int already_has_break_point = 0;
-            long reused_original_instruction = 0;
+            long real_original_instruction = 0;
+
+         /// we loop backwords through all outer recc
             for (int k = 0; k < rec_depth - 1; k++) {
+
+         ///we check if older rec level has the same return address
                 if (return_address_stack[k] == ret_addr) {
                     already_has_break_point = 1;
-                    reused_original_instruction = saved_return_instructions[k];
+                    real_original_instruction = saved_return_instructions[k];
                     break;
                 }
             }
 
-            if (already_has_break_point) {
-                /// 2. just reuse the real original instruction the outer frame already grabbed
-                saved_return_instructions[rec_depth - 1] = reused_original_instruction;
-                /// 3. break_point already planted by that outer frame, nothing more to do here
+            if (already_has_break_point==1) {
+        ///if we alredy has break point we dont read from memory
+                saved_return_instructions[rec_depth - 1] = real_original_instruction;
             } else {
-                /// 2. Backup the real code at that exit door
                 long ret_original = ptrace(PTRACE_PEEKTEXT, child_pid, (void*)ret_addr, NULL);
                 saved_return_instructions[rec_depth - 1] = ret_original;
-
-                /// 3. Plant our 0xCC break_point at the exit door
                 long ret_break_point = (ret_original & ~0xFFL) | 0xCC;
                 ptrace(PTRACE_POKETEXT, child_pid, (void*)ret_addr, (void*)ret_break_point);
             }
 
-            /// 1. Remove the entry trap temporarily so it doesn't crash
+            ///we restore the original instruction at the target function address
             ptrace(PTRACE_POKETEXT, child_pid, (void*)addr, (void*)target_original_instruction);
 
             /// 2. Move the RIP pointer back 1 byte to read the real instruction
             regs.rip = stopped_address;
             ptrace(PTRACE_SETREGS, child_pid, NULL, &regs);
 
-            /// 3. Let it execute exactly ONE instruction, then pause it again
+            /// we update rip
             ptrace(PTRACE_SINGLESTEP, child_pid, NULL, NULL);
             wait(&wait_status);
         }
-        /// --- PATH B: FUNCTION RETURN ---
+
         /// If the program stopped at the return address we saved earlier
         else if (rec_depth > 0 && stopped_address == return_address_stack[rec_depth - 1]) {
 
-            /// check: does a shallower (still-waiting) frame ALSO return through this exact
-            /// same exit door? (same shared-call-site thing as on entry) if so we can't just
-            /// restore-and-forget - that frame still needs the break_point here later on
+            if (regs.rsp <= entry_rsp_stack[rec_depth - 1]) {
+                regs.rip = stopped_address;
+                ptrace(PTRACE_SETREGS, child_pid, NULL, &regs);
+                ptrace(PTRACE_POKETEXT, child_pid, (void*)stopped_address, (void*)saved_return_instructions[rec_depth - 1]);
+                ptrace(PTRACE_SINGLESTEP, child_pid, NULL, NULL);
+                waitpid(child_pid, &wait_status, 0);
+                long orig_instruction = saved_return_instructions[rec_depth - 1];
+                long bp_again = (orig_instruction & ~0xFFL) | 0xCC;
+                ptrace(PTRACE_POKETEXT, child_pid, (void*)stopped_address, (void*)bp_again);
+                continue;
+            }
+
             int break_point_still_needed = 0;
             for (int k = 0; k < rec_depth - 1; k++) {
                 if (return_address_stack[k] == stopped_address) {
@@ -288,24 +286,17 @@ void run_tracer(pid_t child_pid, unsigned long addr, int nr_params)
                 }
             }
 
-            /// 2. If we are finishing the very first (outer) call, print the return value
             if (rec_depth == 1) {
-                printf("  PRF:: call to function returned with %lld\n", (long long)regs.rax);
+                printf("PRF::   call to function returned with %d\n", (int)regs.rax);
             }
-
-            /// 3. We left the function, so decrease the recursion depth
             rec_depth--;
 
-            /// 4. Move RIP back 1 byte to execute the real return instruction
             regs.rip = stopped_address;
             ptrace(PTRACE_SETREGS, child_pid, NULL, &regs);
 
-            if (!break_point_still_needed) {
-                /// 1. nobody else needs this break_point anymore, remove it for real
+            if (break_point_still_needed==0) {
                 ptrace(PTRACE_POKETEXT, child_pid, (void*)stopped_address, (void*)saved_return_instructions[rec_depth]);
             } else {
-                /// 1. someone shallower still needs this break_point: restore it, step past
-                ///    it ourselves, then plant it back so their break_point is there when they return
                 ptrace(PTRACE_POKETEXT, child_pid, (void*)stopped_address, (void*)saved_return_instructions[rec_depth]);
                 ptrace(PTRACE_SINGLESTEP, child_pid, NULL, NULL);
                 waitpid(child_pid, &wait_status, 0);
@@ -319,6 +310,7 @@ void run_tracer(pid_t child_pid, unsigned long addr, int nr_params)
     /// clean up memory
     free(return_address_stack);
     free(saved_return_instructions);
+    free(entry_rsp_stack);
 }
 
 int main(int argc, char* const argv[])
